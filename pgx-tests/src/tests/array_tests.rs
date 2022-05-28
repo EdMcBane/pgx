@@ -232,7 +232,9 @@ mod tests {
                         owned_vec.as_slice().into_datum(),
                     )]),
                 )
-                .first()
+                .iter()
+                .next()
+                .expect("No rows returned")
                 .get_one::<Json>()
                 .expect("returned json was null");
             Ok(Some(json))

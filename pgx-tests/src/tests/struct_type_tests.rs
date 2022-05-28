@@ -75,7 +75,9 @@ mod tests {
         Spi::connect(|client| {
             let complex = client
                 .select("SELECT '1.1,2.2'::complex;", None, None)
-                .first()
+                .iter()
+                .next()
+                .expect("No rows returned")
                 .get_one::<PgBox<Complex>>();
 
             assert!(complex.is_some());
@@ -100,7 +102,9 @@ mod tests {
         Spi::connect(|client| {
             let complex = client
                 .select("SELECT '1.1, 2.2'::complex;", None, None)
-                .first()
+                .iter()
+                .next()
+                .expect("No rows returned")
                 .get_one::<PgBox<Complex>>();
 
             assert!(complex.is_some());
@@ -116,7 +120,11 @@ mod tests {
         let complex = Spi::connect(|mut client| {
             Ok(client.update(
                 "CREATE TABLE complex_test AS SELECT s as id, (s || '.0, 2.0' || s)::complex as value FROM generate_series(1, 1000) s;\
-                SELECT value FROM complex_test ORDER BY id;", None, None).first().get_one::<PgBox<Complex>>())
+                SELECT value FROM complex_test ORDER BY id;", None, None)
+                .iter()
+                .next()
+                .expect("No rows returned")
+                .get_one::<PgBox<Complex>>())
         });
 
         assert!(complex.is_some());

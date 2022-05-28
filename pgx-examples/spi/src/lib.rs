@@ -76,10 +76,12 @@ fn spi_query_by_id(id: i64) -> Option<String> {
                 "SELECT id, title FROM spi.spi_example WHERE id = $1",
                 None,
                 Some(vec![(PgBuiltInOids::INT8OID.oid(), id.into_datum())]),
-            )
-            .first();
+            );
 
-        Ok(Some(tuptable.get_two::<i64, String>()))
+        Ok(Some(tuptable.iter()
+            .next()
+            .expect("No rows returned")
+            .get_two::<i64, String>()))
     })
     .unwrap();
 

@@ -40,7 +40,9 @@ mod tests {
         let rc = Spi::connect(|client| {
             Ok(client
                 .select("SELECT 42", None, None)
-                .first()
+                .iter()
+                .next()
+                .expect("No rows returned")
                 .get_datum::<i32>(1))
         });
 
@@ -52,7 +54,9 @@ mod tests {
         let rc = Spi::connect(|client| {
             Ok(client
                 .select("SELECT 'this is a test'", None, None)
-                .first()
+                .iter()
+                .next()
+                .expect("No rows returned")
                 .get_datum::<&str>(1))
         });
 
@@ -67,7 +71,9 @@ mod tests {
         let rc = Spi::connect(|client| {
             Ok(client
                 .select("SELECT 'this is a test'", None, None)
-                .first()
+                .iter()
+                .next()
+                .expect("No rows returned")
                 .get_datum::<String>(1))
         });
 
@@ -82,7 +88,9 @@ mod tests {
         Spi::execute(|client| {
             let i = client
                 .select("SELECT 42::bigint", None, None)
-                .first()
+                .iter()
+                .next()
+                .expect("No rows returned")
                 .get_one::<i64>();
             assert_eq!(42, i.unwrap());
         });
@@ -93,7 +101,9 @@ mod tests {
         Spi::execute(|client| {
             let (i, s) = client
                 .select("SELECT 42, 'test'", None, None)
-                .first()
+                .iter()
+                .next()
+                .expect("No rows returned")
                 .get_two::<i64, &str>();
 
             assert_eq!(42, i.unwrap());
@@ -106,7 +116,9 @@ mod tests {
         Spi::execute(|client| {
             let (i, s, b) = client
                 .select("SELECT 42, 'test', true", None, None)
-                .first()
+                .iter()
+                .next()
+                .expect("No rows returned")
                 .get_three::<i64, &str, bool>();
 
             assert_eq!(42, i.unwrap());
@@ -115,12 +127,14 @@ mod tests {
         });
     }
 
-    #[pg_test]
+    #[pg_test] // TODO: although this can be handled, I find the current API surprising
     fn test_spi_get_two_with_failure() {
         Spi::execute(|client| {
             let (i, s) = client
                 .select("SELECT 42", None, None)
-                .first()
+                .iter()
+                .next()
+                .expect("No rows returned")
                 .get_two::<i64, &str>();
 
             assert_eq!(42, i.unwrap());
@@ -128,12 +142,14 @@ mod tests {
         });
     }
 
-    #[pg_test]
+    #[pg_test] // TODO: although this can be handled, I find the current API surprising
     fn test_spi_get_three_failure() {
         Spi::execute(|client| {
             let (i, s, b) = client
                 .select("SELECT 42, 'test'", None, None)
-                .first()
+                .iter()
+                .next()
+                .expect("No rows returned")
                 .get_three::<i64, &str, bool>();
 
             assert_eq!(42, i.unwrap());
@@ -142,7 +158,7 @@ mod tests {
         });
     }
 
-    #[pg_test]
+    #[pg_test] // TODO: although this can be handled, I find the current API surprising
     fn test_spi_select_zero_rows() {
         assert!(Spi::get_one::<i32>("SELECT 1 LIMIT 0").is_none());
     }
@@ -179,6 +195,26 @@ mod tests {
 
             fn sum_all(table: SpiTupleTable) -> i32 {
                 table.iter().map(|r| r.by_ordinal(1).unwrap().value::<i32>().unwrap()).sum()
+            }
+            assert_eq!(sum_all(portal.fetch(3)), 1+2+3);
+            assert_eq!(sum_all(portal.fetch(3)), 4+5+6);
+            assert_eq!(sum_all(portal.fetch(3)), 7+8+9);
+            assert_eq!(sum_all(portal.fetch(3)), 10);
+        });
+    }
+
+    #[pg_test]
+    fn test_cursor_close_fetch_result() {
+        Spi::execute(|mut client| {
+            client.update("CREATE TABLE tests.cursor_table (id int)", None, None);
+            client.update("INSERT INTO tests.cursor_table (id) \
+            SELECT i FROM generate_series(1, 10) AS t(i)", None, None);
+            let mut portal = client.open_cursor("SELECT * FROM tests.cursor_table", None);
+
+            fn sum_all(table: SpiTupleTable) -> i32 {
+                let result = table.iter().map(|r| r.by_ordinal(1).unwrap().value::<i32>().unwrap()).sum();
+                unsafe { table.close(); }
+                result
             }
             assert_eq!(sum_all(portal.fetch(3)), 1+2+3);
             assert_eq!(sum_all(portal.fetch(3)), 4+5+6);

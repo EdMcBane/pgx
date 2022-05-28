@@ -15,6 +15,7 @@ use num_traits::FromPrimitive;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::ops::{Index, IndexMut};
+use pgx_pg_sys::SPI_freetuptable;
 
 #[derive(Debug, Primitive)]
 pub enum SpiOk {
@@ -70,18 +71,18 @@ pub struct SpiTupleTable<'client> {
     table: *mut pg_sys::SPITupleTable,
     size: usize,
     tupdesc: Option<pg_sys::TupleDesc>,
-    current: isize,
     _client: &'client SpiClient,
 }
 
-impl Drop for SpiTupleTable<'_> {
-    fn drop(&mut self) {
-        unsafe {
-            info!("drop");
-            pg_sys::SPI_freetuptable(self.table);
-        }
-    }
-}
+// TODO: unfortunately we can't have nice things
+// impl Drop for SpiTupleTable<'_> {
+//     fn drop(&mut self) {
+//         unsafe {
+//             info!("drop");
+//             pg_sys::SPI_freetuptable(self.table);
+//         }
+//     }
+// }
 
 /// Represents a single `pg_sys::Datum` inside a `SpiHeapTupleData`
 pub struct SpiHeapTupleDataEntry<'t> {
@@ -100,7 +101,7 @@ pub struct SpiHeapTupleData<'t> {
 impl Spi {
     pub fn get_one<A: FromDatum + IntoDatum>(query: &str) -> Option<A> {
         Spi::connect(|client| {
-            let result = client.select(query, Some(1), None).first().get_one();
+            let result = client.select(query, Some(1), None).iter().next().expect("No rows returned").get_one();
             info!("now yield");
             Ok(result)
         })
@@ -112,7 +113,9 @@ impl Spi {
         Spi::connect(|client| {
             let (a, b) = client
                 .select(query, Some(1), None)
-                .first()
+                .iter()
+                .next()
+                .expect("No rows returned")
                 .get_two::<A, B>();
             Ok(Some((a, b)))
         })
@@ -129,7 +132,9 @@ impl Spi {
         Spi::connect(|client| {
             let (a, b, c) = client
                 .select(query, Some(1), None)
-                .first()
+                .iter()
+                .next()
+                .expect("No rows returned")
                 .get_three::<A, B, C>();
             Ok(Some((a, b, c)))
         })
@@ -140,7 +145,12 @@ impl Spi {
         query: &str,
         args: Vec<(PgOid, Option<pg_sys::Datum>)>,
     ) -> Option<A> {
-        Spi::connect(|client| Ok(client.select(query, Some(1), Some(args)).first().get_one()))
+        Spi::connect(|client|
+            Ok(client.select(query, Some(1), Some(args))
+                .iter()
+                .next()
+                .expect("No rows returned")
+                .get_one()))
     }
 
     pub fn get_two_with_args<A: FromDatum + IntoDatum, B: FromDatum + IntoDatum>(
@@ -150,7 +160,9 @@ impl Spi {
         Spi::connect(|client| {
             let (a, b) = client
                 .select(query, Some(1), Some(args))
-                .first()
+                .iter()
+                .next()
+                .expect("No rows returned")
                 .get_two::<A, B>();
             Ok(Some((a, b)))
         })
@@ -168,7 +180,9 @@ impl Spi {
         Spi::connect(|client| {
             let (a, b, c) = client
                 .select(query, Some(1), Some(args))
-                .first()
+                .iter()
+                .next()
+                .expect("No rows returned")
                 .get_three::<A, B, C>();
             Ok(Some((a, b, c)))
         })
@@ -190,10 +204,12 @@ impl Spi {
     pub fn explain(query: &str) -> Json {
         Spi::connect(|client| {
             let table = client
-                .update(&format!("EXPLAIN (format json) {}", query), None, None)
-                .first();
+                .update(&format!("EXPLAIN (format json) {}", query), None, None);
+            let tuple = table.iter()
+                .next()
+                .expect("No rows returned");
             Ok(Some(
-                table
+                tuple
                     .get_one::<Json>()
                     .expect("failed to get json EXPLAIN result"),
             ))
@@ -390,7 +406,6 @@ impl SpiClient {
             } else {
                 Some(unsafe { (*pg_sys::SPI_tuptable).tupdesc })
             },
-            current: -1,
             _client: client,
         }
     }
@@ -491,7 +506,6 @@ impl SpiCursor<'_> {
             } else {
                 Some(unsafe { (*pg_sys::SPI_tuptable).tupdesc })
             },
-            current: -1,
             _client: &self.client,
         }
     }
@@ -516,14 +530,6 @@ impl SpiCursor<'_> {
 
 
 impl SpiTupleTable<'_> {
-    /// `SpiTupleTable`s are positioned before the start, for iteration purposes.
-    ///
-    /// This method moves the position to the first row.  If there are no rows, this
-    /// method will silently return.
-    pub fn first(mut self) -> Self {
-        self.current = 0;
-        self
-    }
 
     /// How many rows were processed?
     pub fn len(&self) -> usize {
@@ -534,78 +540,24 @@ impl SpiTupleTable<'_> {
         self.len() == 0
     }
 
-    pub fn get_one<A: FromDatum>(&self) -> Option<A> {
-        info!("now get");
-        self.get_datum(1)
-    }
-
-    pub fn get_two<A: FromDatum, B: FromDatum>(&self) -> (Option<A>, Option<B>) {
-        let a = self.get_datum::<A>(1);
-        let b = self.get_datum::<B>(2);
-        (a, b)
-    }
-
-    pub fn get_three<A: FromDatum, B: FromDatum, C: FromDatum>(
-        &self,
-    ) -> (Option<A>, Option<B>, Option<C>) {
-        let a = self.get_datum::<A>(1);
-        let b = self.get_datum::<B>(2);
-        let c = self.get_datum::<C>(3);
-        (a, b, c)
-    }
-
-    pub fn get_heap_tuple(&self) -> Option<SpiHeapTupleData> {
-        if self.current < 0 {
-            panic!("SpiTupleTable positioned before start")
-        }
-        if self.current as u64 >= unsafe { pg_sys::SPI_processed } {
-            None
-        } else {
-            match self.tupdesc {
-                Some(tupdesc) => unsafe {
-                    let heap_tuple = std::slice::from_raw_parts((*self.table).vals, self.size)
-                        [self.current as usize];
-
-                    // SAFETY:  we know heap_tuple is valid because we just made it
-                    Some(SpiHeapTupleData::new(self, tupdesc, heap_tuple))
-                },
-                None => panic!("TupDesc is NULL"),
-            }
-        }
-    }
-
-    pub fn get_datum<T: FromDatum>(&self, ordinal: i32) -> Option<T> {
-        if self.current < 0 {
-            panic!("SpiTupleTable positioned before start")
-        }
-        if self.current as u64 >= unsafe { pg_sys::SPI_processed } {
-            None
-        } else {
-            match self.tupdesc {
-                Some(tupdesc) => unsafe {
-                    let natts = (*tupdesc).natts;
-
-                    if ordinal < 1 || ordinal > natts {
-                        None
-                    } else {
-                        let heap_tuple = std::slice::from_raw_parts((*self.table).vals, self.size)
-                            [self.current as usize];
-                        let mut is_null = false;
-                        let datum =
-                            pg_sys::SPI_getbinval(heap_tuple, tupdesc, ordinal, &mut is_null);
-
-                        T::from_datum(datum, is_null, pg_sys::SPI_gettypeid(tupdesc, ordinal))
-                    }
-                },
-                None => panic!("TupDesc is NULL"),
-            }
-        }
-    }
     pub fn iter(&self) -> SpiTupleTableIter {
         SpiTupleTableIter {
             table: self,
             current: 0,
         }
+    }
+
+    /// closes the SpiTupleTable, releasing the associated memory
+    ///
+    /// Ideally we'd like the following to happen in a [`Drop`] implementation;
+    ///  unfortunately, borrowed zero-copy [`FromDatum`]s (e.g &'str) have an inferred
+    ///  unconstrained lifetime, and would become invalid if e.g. returned from [`Spi::get_one()`].
+    /// [`Spi::connect()`] value-copying would not help as it would happen after the table is dropped.
+    ///
+    /// ## Safety
+    /// caller must ensure no borrowed zero-copy [`FromDatum`]s (e.g &'str) will survive the instance
+    pub unsafe fn close(self) {
+        SPI_freetuptable(self.table);
     }
 }
 
@@ -632,6 +584,25 @@ impl<'t> SpiHeapTupleData<'t> {
         }
 
         data
+    }
+
+    pub fn get_one<A: FromDatum>(&self) -> Option<A> {
+        self.by_ordinal(1).expect("Can't get one").value()
+    }
+
+    pub fn get_two<A: FromDatum, B: FromDatum>(&self) -> (Option<A>, Option<B>) {
+        let a = self.by_ordinal(1).expect("Can't get first col").value();
+        let b = self.by_ordinal(2).expect("Can't get second col").value();
+        (a,b)
+    }
+
+    pub fn get_three<A: FromDatum, B: FromDatum, C: FromDatum>(
+        &self,
+    ) -> (Option<A>, Option<B>, Option<C>) {
+        let a = self.by_ordinal(1).expect("Can't get first col").value();
+        let b = self.by_ordinal(2).expect("Can't get second col").value();
+        let c = self.by_ordinal(3).expect("Can't get third col").value();
+        (a,b,c)
     }
 
     /// Get a typed Datum value from this HeapTuple by its ordinal position.
@@ -816,6 +787,21 @@ pub struct SpiTupleTableIter<'t> {
     table: &'t SpiTupleTable<'t>,
     current: usize,
 }
+impl<'t> SpiTupleTableIter<'t> {
+    pub fn get_heap_tuple(&self) -> Option<SpiHeapTupleData<'t>> {
+        match self.table.tupdesc {
+            Some(tupdesc) => unsafe {
+                let heap_tuple = std::slice::from_raw_parts((*self.table.table).vals, self.table.size)
+                    [self.current as usize];
+
+                // SAFETY:  we know heap_tuple is valid because we just made it
+                Some(SpiHeapTupleData::new(self.table, tupdesc, heap_tuple))
+            },
+            None => panic!("TupDesc is NULL"),
+        }
+    }
+
+}
 
 impl<'t> Iterator for SpiTupleTableIter<'t> {
     type Item = SpiHeapTupleData<'t>;
@@ -825,7 +811,7 @@ impl<'t> Iterator for SpiTupleTableIter<'t> {
         if self.current >= self.table.size {
             None
         } else {
-            let res = self.table.get_heap_tuple();
+            let res = self.get_heap_tuple();
             self.current += 1;
             res
         }
