@@ -178,7 +178,7 @@ mod tests {
             let mut portal = client.open_cursor("SELECT * FROM tests.cursor_table", None);
 
             fn sum_all(table: SpiTupleTable) -> i32 {
-                table.map(|r| r.by_ordinal(1).unwrap().value::<i32>().unwrap()).sum()
+                table.iter().map(|r| r.by_ordinal(1).unwrap().value::<i32>().unwrap()).sum()
             }
             assert_eq!(sum_all(portal.fetch(3)), 1+2+3);
             assert_eq!(sum_all(portal.fetch(3)), 4+5+6);
@@ -199,7 +199,7 @@ mod tests {
         }).unwrap();
 
         fn sum_all(table: SpiTupleTable) -> i32 {
-            table.map(|r| r.by_ordinal(1).unwrap().value::<i32>().unwrap()).sum()
+            table.iter().map(|r| r.by_ordinal(1).unwrap().value::<i32>().unwrap()).sum()
         }
         Spi::connect(|mut client| {
             let mut cursor = client.find_cursor(cursor_name.clone());

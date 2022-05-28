@@ -70,7 +70,7 @@ pub extern "C" fn background_worker_main(arg: pg_sys::Datum) {
                     None,
                     None,
                 );
-                tuple_table.for_each(|tuple| {
+                tuple_table.iter().for_each(|tuple| {
                     let a = tuple.by_ordinal(1).unwrap().value::<String>().unwrap();
                     let b = tuple.by_ordinal(2).unwrap().value::<i32>().unwrap();
                     let c = tuple.by_ordinal(3).unwrap().value::<String>().unwrap();

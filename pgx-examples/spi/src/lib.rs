@@ -46,6 +46,7 @@ fn spi_return_query(
     Spi::connect(|client| {
         client
             .select(query, None, None)
+            .iter()
             .map(|row| (row["oid"].value(), row[2].value()))
             .for_each(|tuple| results.push(tuple));
         Ok(Some(()))

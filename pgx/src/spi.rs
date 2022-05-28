@@ -60,34 +60,48 @@ pub enum SpiError {
 
 pub struct Spi;
 
+#[derive(Debug)]
 pub struct SpiClient;
 
 #[derive(Debug)]
-pub struct SpiTupleTable {
+pub struct SpiTupleTable<'client> {
     #[allow(dead_code)]
     status_code: SpiOk,
     table: *mut pg_sys::SPITupleTable,
     size: usize,
     tupdesc: Option<pg_sys::TupleDesc>,
     current: isize,
+    _client: &'client SpiClient,
+}
+
+impl Drop for SpiTupleTable<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            info!("drop");
+            pg_sys::SPI_freetuptable(self.table);
+        }
+    }
 }
 
 /// Represents a single `pg_sys::Datum` inside a `SpiHeapTupleData`
-pub struct SpiHeapTupleDataEntry {
+pub struct SpiHeapTupleDataEntry<'t> {
     datum: Option<pg_sys::Datum>,
     type_oid: pg_sys::Oid,
+    _table: &'t SpiTupleTable<'t>,
 }
 
 /// Represents the set of `pg_sys::Datum`s in a `pg_sys::HeapTuple`
-pub struct SpiHeapTupleData {
+pub struct SpiHeapTupleData<'t> {
     tupdesc: pg_sys::TupleDesc,
-    entries: HashMap<usize, SpiHeapTupleDataEntry>,
+    entries: HashMap<usize, SpiHeapTupleDataEntry<'t>>,
+    _table: &'t SpiTupleTable<'t>,
 }
 
 impl Spi {
     pub fn get_one<A: FromDatum + IntoDatum>(query: &str) -> Option<A> {
         Spi::connect(|client| {
             let result = client.select(query, Some(1), None).first().get_one();
+            info!("now yield");
             Ok(result)
         })
     }
@@ -102,7 +116,7 @@ impl Spi {
                 .get_two::<A, B>();
             Ok(Some((a, b)))
         })
-        .unwrap()
+            .unwrap()
     }
 
     pub fn get_three<
@@ -119,7 +133,7 @@ impl Spi {
                 .get_three::<A, B, C>();
             Ok(Some((a, b, c)))
         })
-        .unwrap()
+            .unwrap()
     }
 
     pub fn get_one_with_args<A: FromDatum + IntoDatum>(
@@ -140,7 +154,7 @@ impl Spi {
                 .get_two::<A, B>();
             Ok(Some((a, b)))
         })
-        .unwrap()
+            .unwrap()
     }
 
     pub fn get_three_with_args<
@@ -158,7 +172,7 @@ impl Spi {
                 .get_three::<A, B, C>();
             Ok(Some((a, b, c)))
         })
-        .unwrap()
+            .unwrap()
     }
 
     /// just run an arbitrary SQL statement.
@@ -167,14 +181,14 @@ impl Spi {
     ///
     /// The statement runs in read/write mode
     pub fn run(query: &str) {
-        Spi::execute(|mut client| {
+        Spi::execute(|client| {
             client.update(query, None, None);
         })
     }
 
     /// explain a query, returning its result in json form
     pub fn explain(query: &str) -> Json {
-        Spi::connect(|mut client| {
+        Spi::connect(|client| {
             let table = client
                 .update(&format!("EXPLAIN (format json) {}", query), None, None)
                 .first();
@@ -184,7 +198,7 @@ impl Spi {
                     .expect("failed to get json EXPLAIN result"),
             ))
         })
-        .unwrap()
+            .unwrap()
     }
 
     /// execute SPI commands via the provided `SpiClient`
@@ -285,12 +299,12 @@ impl Spi {
 
 impl SpiClient {
     /// perform a SELECT statement
-    pub fn select(
-        &self,
-        query: &str,
+    pub fn select<'t, 's>(
+        &'t self,
+        query: &'s str,
         limit: Option<i64>,
         args: Option<Vec<(PgOid, Option<pg_sys::Datum>)>>,
-    ) -> SpiTupleTable {
+    ) -> SpiTupleTable<'t> {
         // Postgres docs say:
         //
         //    It is generally unwise to mix read-only and read-write commands within a single function
@@ -302,25 +316,26 @@ impl SpiClient {
         // TODO:  can we detect if the command counter (or something?) has incremented and if yes
         //        then we set read_only=false, else we can set it to true?
         //        Is this even a good idea?
-        SpiClient::execute(query, false, limit, args)
+        SpiClient::execute(self, query, false, limit, args)
     }
 
     /// perform any query (including utility statements) that modify the database in some way
     pub fn update(
-        &mut self,
+        &self,
         query: &str,
         limit: Option<i64>,
         args: Option<Vec<(PgOid, Option<pg_sys::Datum>)>>,
     ) -> SpiTupleTable {
-        SpiClient::execute(query, false, limit, args)
+        SpiClient::execute(self, query, false, limit, args)
     }
 
-    fn execute(
-        query: &str,
+    fn execute<'c, 's>(
+        client: &'c SpiClient,
+        query: &'s str,
         read_only: bool,
         limit: Option<i64>,
         args: Option<Vec<(PgOid, Option<pg_sys::Datum>)>>,
-    ) -> SpiTupleTable {
+    ) -> SpiTupleTable<'c> {
         unsafe {
             pg_sys::SPI_tuptable = std::ptr::null_mut();
         }
@@ -376,13 +391,14 @@ impl SpiClient {
                 Some(unsafe { (*pg_sys::SPI_tuptable).tupdesc })
             },
             current: -1,
+            _client: client,
         }
     }
 
     /// sets up a cursor that will execute the specified query.
     /// Rows may be fetched then using [`SpiCursor::fetch`]
     pub fn open_cursor(
-        &mut self,
+        &self,
         query: &str,
         args: Option<Vec<(PgOid, Option<pg_sys::Datum>)>>,
     ) -> SpiCursor {
@@ -424,7 +440,7 @@ impl SpiClient {
                 0,
             )
         };
-        SpiCursor { ptr }
+        SpiCursor { ptr, client: self }
     }
 
     /// find a cursor in transaction by name. Name should usually be retrieved via [`SpiCursor::into_name`]
@@ -440,16 +456,17 @@ impl SpiClient {
         if ptr.is_null() {
             error!("cursor named \"{}\" not found", name);
         }
-        SpiCursor { ptr }
+        SpiCursor { ptr, client: self }
     }
 }
 
 
-pub struct SpiCursor {
+pub struct SpiCursor<'client> {
     ptr: pg_sys::Portal,
+    client: &'client SpiClient,
 }
 
-impl SpiCursor {
+impl SpiCursor<'_> {
     /// fetch some rows from a cursor
     pub fn fetch(
         &mut self,
@@ -475,6 +492,7 @@ impl SpiCursor {
                 Some(unsafe { (*pg_sys::SPI_tuptable).tupdesc })
             },
             current: -1,
+            _client: &self.client,
         }
     }
 
@@ -497,7 +515,7 @@ impl SpiCursor {
 }
 
 
-impl SpiTupleTable {
+impl SpiTupleTable<'_> {
     /// `SpiTupleTable`s are positioned before the start, for iteration purposes.
     ///
     /// This method moves the position to the first row.  If there are no rows, this
@@ -517,6 +535,7 @@ impl SpiTupleTable {
     }
 
     pub fn get_one<A: FromDatum>(&self) -> Option<A> {
+        info!("now get");
         self.get_datum(1)
     }
 
@@ -548,7 +567,7 @@ impl SpiTupleTable {
                         [self.current as usize];
 
                     // SAFETY:  we know heap_tuple is valid because we just made it
-                    Some(SpiHeapTupleData::new(tupdesc, heap_tuple))
+                    Some(SpiHeapTupleData::new(self, tupdesc, heap_tuple))
                 },
                 None => panic!("TupDesc is NULL"),
             }
@@ -582,14 +601,21 @@ impl SpiTupleTable {
             }
         }
     }
+    pub fn iter(&self) -> SpiTupleTableIter {
+        SpiTupleTableIter {
+            table: self,
+            current: 0,
+        }
+    }
 }
 
-impl SpiHeapTupleData {
+impl<'t> SpiHeapTupleData<'t> {
     /// Create a new `SpiHeapTupleData` from its constituent parts
-    pub unsafe fn new(tupdesc: pg_sys::TupleDesc, htup: *mut pg_sys::HeapTupleData) -> Self {
+    pub unsafe fn new(table: &'t SpiTupleTable, tupdesc: pg_sys::TupleDesc, htup: *mut pg_sys::HeapTupleData) -> Self {
         let mut data = SpiHeapTupleData {
             tupdesc,
             entries: HashMap::default(),
+            _table: table,
         };
 
         for i in 1..=tupdesc.as_ref().unwrap().natts {
@@ -601,13 +627,14 @@ impl SpiHeapTupleData {
                 .or_insert_with(|| SpiHeapTupleDataEntry {
                     datum: if is_null { None } else { Some(datum) },
                     type_oid: pg_sys::SPI_gettypeid(tupdesc, i),
+                    _table: table,
                 });
         }
 
         data
     }
 
-    /// Get a typed Datum value from this HeapTuple by its ordinal position.  
+    /// Get a typed Datum value from this HeapTuple by its ordinal position.
     ///
     /// The ordinal position is 1-based
     #[deprecated(since = "0.1.6", note = "Please use the `by_ordinal` function instead")]
@@ -618,7 +645,7 @@ impl SpiHeapTupleData {
         }
     }
 
-    /// Get a typed Datum value from this HeapTuple by its ordinal position.  
+    /// Get a typed Datum value from this HeapTuple by its ordinal position.
     ///
     /// The ordinal position is 1-based.
     ///
@@ -626,17 +653,17 @@ impl SpiHeapTupleData {
     pub fn by_ordinal(
         &self,
         ordinal: usize,
-    ) -> std::result::Result<&SpiHeapTupleDataEntry, SpiError> {
+    ) -> std::result::Result<&SpiHeapTupleDataEntry<'t>, SpiError> {
         match self.entries.get(&ordinal) {
             Some(datum) => Ok(datum),
             None => Err(SpiError::Noattribute),
         }
     }
 
-    /// Get a typed Datum value from this HeapTuple by its field name.  
+    /// Get a typed Datum value from this HeapTuple by its field name.
     ///
     /// If the specified name does not exist a `Err(SpiError::Noattribute)` is returned
-    pub fn by_name(&self, name: &str) -> std::result::Result<&SpiHeapTupleDataEntry, SpiError> {
+    pub fn by_name(&self, name: &str) -> std::result::Result<&SpiHeapTupleDataEntry<'t>, SpiError> {
         use crate::pg_sys::AsPgCStr;
         unsafe {
             let fnumber = pg_sys::SPI_fnumber(self.tupdesc, name.as_pg_cstr());
@@ -648,7 +675,7 @@ impl SpiHeapTupleData {
         }
     }
 
-    /// Get a mutable typed Datum value from this HeapTuple by its ordinal position.  
+    /// Get a mutable typed Datum value from this HeapTuple by its ordinal position.
     ///
     /// The ordinal position is 1-based.
     ///
@@ -656,20 +683,20 @@ impl SpiHeapTupleData {
     pub fn by_ordinal_mut(
         &mut self,
         ordinal: usize,
-    ) -> std::result::Result<&mut SpiHeapTupleDataEntry, SpiError> {
+    ) -> std::result::Result<&mut SpiHeapTupleDataEntry<'t>, SpiError> {
         match self.entries.get_mut(&ordinal) {
             Some(datum) => Ok(datum),
             None => Err(SpiError::Noattribute),
         }
     }
 
-    /// Get a mutable typed Datum value from this HeapTuple by its field name.  
+    /// Get a mutable typed Datum value from this HeapTuple by its field name.
     ///
     /// If the specified name does not exist a `Err(SpiError::Noattribute)` is returned
     pub fn by_name_mut(
         &mut self,
         name: &str,
-    ) -> std::result::Result<&mut SpiHeapTupleDataEntry, SpiError> {
+    ) -> std::result::Result<&mut SpiHeapTupleDataEntry<'t>, SpiError> {
         use crate::pg_sys::AsPgCStr;
         unsafe {
             let fnumber = pg_sys::SPI_fnumber(self.tupdesc, name.as_pg_cstr());
@@ -698,6 +725,7 @@ impl SpiHeapTupleData {
                     SpiHeapTupleDataEntry {
                         datum: datum.into_datum(),
                         type_oid: T::type_oid(),
+                        _table: self._table,
                     },
                 );
                 Ok(())
@@ -724,17 +752,18 @@ impl SpiHeapTupleData {
         }
     }
 }
+// FIXME
+// impl<Datum: IntoDatum + FromDatum> From<Datum> for SpiHeapTupleDataEntry<'_> {
+//     fn from(datum: Datum) -> Self {
+//         SpiHeapTupleDataEntry {
+//             datum: datum.into_datum(),
+//             type_oid: Datum::type_oid(),
+//             table:
+//         }
+//     }
+// }
 
-impl<Datum: IntoDatum + FromDatum> From<Datum> for SpiHeapTupleDataEntry {
-    fn from(datum: Datum) -> Self {
-        SpiHeapTupleDataEntry {
-            datum: datum.into_datum(),
-            type_oid: Datum::type_oid(),
-        }
-    }
-}
-
-impl SpiHeapTupleDataEntry {
+impl SpiHeapTupleDataEntry<'_> {
     pub fn value<T: FromDatum>(&self) -> Option<T> {
         match self.datum.as_ref() {
             Some(datum) => unsafe { T::from_datum(*datum, false, self.type_oid) },
@@ -746,70 +775,71 @@ impl SpiHeapTupleDataEntry {
 /// Provide ordinal indexing into a `SpiHeapTupleData`.
 ///
 /// If the index is out of bounds, it will panic
-impl Index<usize> for SpiHeapTupleData {
-    type Output = SpiHeapTupleDataEntry;
+impl<'td> Index<usize> for SpiHeapTupleData<'td> {
+    type Output = SpiHeapTupleDataEntry<'td>;
 
     fn index(&self, index: usize) -> &Self::Output {
         self.by_ordinal(index).expect("invalid ordinal value")
     }
 }
 
-/// Provide named indexing into a `SpiHeapTupleData`.  
+/// Provide named indexing into a `SpiHeapTupleData`.
 ///
 /// If the field name doesn't exist, it will panic
-impl Index<&str> for SpiHeapTupleData {
-    type Output = SpiHeapTupleDataEntry;
+impl<'t> Index<&str> for SpiHeapTupleData<'t> {
+    type Output = SpiHeapTupleDataEntry<'t>;
 
     fn index(&self, index: &str) -> &Self::Output {
         self.by_name(index).expect("invalid field name")
     }
 }
 
-/// Provide mutable ordinal indexing into a `SpiHeapTupleData`.  
+/// Provide mutable ordinal indexing into a `SpiHeapTupleData`.
 ///
 /// If the index is out of bounds, it will panic
-impl IndexMut<usize> for SpiHeapTupleData {
+impl<'t> IndexMut<usize> for SpiHeapTupleData<'t> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         self.by_ordinal_mut(index).expect("invalid ordinal value")
     }
 }
 
-/// Provide mutable named indexing into a `SpiHeapTupleData`.  
+/// Provide mutable named indexing into a `SpiHeapTupleData`.
 ///
 /// If the field name doesn't exist, it will panic
-impl IndexMut<&str> for SpiHeapTupleData {
+impl IndexMut<&str> for SpiHeapTupleData<'_> {
     fn index_mut(&mut self, index: &str) -> &mut Self::Output {
         self.by_name_mut(index).expect("invalid field name")
     }
 }
 
-impl Iterator for SpiTupleTable {
-    type Item = SpiHeapTupleData;
+pub struct SpiTupleTableIter<'t> {
+    table: &'t SpiTupleTable<'t>,
+    current: usize,
+}
+
+impl<'t> Iterator for SpiTupleTableIter<'t> {
+    type Item = SpiHeapTupleData<'t>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current >= self.size as isize {
-            self.current = -1;
+        if self.current >= self.table.size {
             None
         } else {
+            let res = self.table.get_heap_tuple();
             self.current += 1;
-            assert!(self.current >= 0);
-            self.get_heap_tuple()
+            res
         }
     }
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.size))
+        (0, Some(self.table.size))
     }
 
     #[inline]
     fn count(self) -> usize
-    where
-        Self: Sized,
+        where
+            Self: Sized,
     {
-        self.size
+        self.table.size
     }
-
-    // Removed this function as it comes with an iterator
-    //fn nth(&mut self, mut n: usize) -> Option<Self::Item> {
 }

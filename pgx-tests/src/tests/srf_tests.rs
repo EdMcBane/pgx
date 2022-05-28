@@ -82,7 +82,7 @@ mod tests {
                 client.select("SELECT * FROM example_generate_series(1, 10)", None, None);
 
             let mut expect = 0;
-            while table.next().is_some() {
+            while table.iter().next().is_some() {
                 let value = table.get_one::<i32>().expect("value was NULL");
 
                 expect += 1;
@@ -101,7 +101,7 @@ mod tests {
             let mut table = client.select("SELECT * FROM example_composite_set()", None, None);
 
             let mut expect = 0;
-            while table.next().is_some() {
+            while table.iter().next().is_some() {
                 let (idx, value) = table.get_two::<i32, &str>();
                 let idx = idx.expect("idx was null");
                 let value = value.expect("value was null");
