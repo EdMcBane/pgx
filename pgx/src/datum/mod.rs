@@ -31,9 +31,11 @@ mod time_with_timezone;
 mod tuples;
 mod uuid;
 mod varlena;
+mod name;
 
 pub use self::time::*;
 pub use self::uuid::*;
+pub use self::name::*;
 pub use anyarray::*;
 pub use anyelement::*;
 pub use array::*;

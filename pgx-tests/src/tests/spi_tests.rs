@@ -216,4 +216,11 @@ mod tests {
         struct T;
         assert!(matches!(Spi::connect(|_| Ok(Some(T))).unwrap(), T));
     }
+
+    #[pg_test]
+    fn test_name_attributes_can_be_read_properly() {
+        let db_text: String = Spi::get_one("select current_database()::text").unwrap();
+        let db_name: pgx::datum::Name = Spi::get_one("select current_database()").unwrap();
+        assert_eq!(db_text.as_str(), db_name.as_str());
+    }
 }
