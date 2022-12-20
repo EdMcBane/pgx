@@ -9,7 +9,7 @@ Use of this source code is governed by the MIT license that can be found in the 
 
 //! Safe access to Postgres' *Server Programming Interface* (SPI).
 
-use crate::{pg_sys, FromDatum, IntoDatum, Json, PgMemoryContexts, PgOid, TryFromDatumError};
+use crate::{pg_sys, FromDatum, IntoDatum, Json, PgMemoryContexts, PgOid, TryFromDatumError, PostgresType, JsonB};
 use core::fmt::Formatter;
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -18,6 +18,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Index, IndexMut};
 use std::ptr::NonNull;
+use serde::Deserialize;
 
 /// These match the Postgres `#define`d constants prefixed `SPI_OK_*` that you can find in `pg_sys`.
 #[derive(Debug, PartialEq)]
@@ -182,35 +183,36 @@ pub struct SpiHeapTupleData {
     entries: HashMap<usize, SpiHeapTupleDataEntry>,
 }
 
+// Spi::get_xxx methods cannot return borrowed data, as the connection is closed when the value is returned
 impl Spi {
-    pub fn get_one<A: FromDatum + IntoDatum>(query: &str) -> Result<Option<A>, Error> {
+    pub fn get_one<A: for<'a> SpiDatum<'a>>(query: &str) -> Result<Option<A>, Error> {
         Spi::connect(|client| client.select(query, Some(1), None).first().get_one())
     }
 
-    pub fn get_two<A: FromDatum + IntoDatum, B: FromDatum + IntoDatum>(
+    pub fn get_two<A: for<'a> SpiDatum<'a>, B: for<'a> SpiDatum<'a>>(
         query: &str,
     ) -> Result<(Option<A>, Option<B>), Error> {
         Spi::connect(|client| client.select(query, Some(1), None).first().get_two::<A, B>())
     }
 
     pub fn get_three<
-        A: FromDatum + IntoDatum,
-        B: FromDatum + IntoDatum,
-        C: FromDatum + IntoDatum,
+        A: for<'a> SpiDatum<'a>,
+        B: for<'a> SpiDatum<'a>,
+        C: for<'a> SpiDatum<'a>,
     >(
         query: &str,
     ) -> Result<(Option<A>, Option<B>, Option<C>), Error> {
         Spi::connect(|client| client.select(query, Some(1), None).first().get_three::<A, B, C>())
     }
 
-    pub fn get_one_with_args<A: FromDatum + IntoDatum>(
+    pub fn get_one_with_args<A: for<'a> SpiDatum<'a>>(
         query: &str,
         args: Vec<(PgOid, Option<pg_sys::Datum>)>,
     ) -> Result<Option<A>, Error> {
         Spi::connect(|client| client.select(query, Some(1), Some(args)).first().get_one())
     }
 
-    pub fn get_two_with_args<A: FromDatum + IntoDatum, B: FromDatum + IntoDatum>(
+    pub fn get_two_with_args<A: for<'a> SpiDatum<'a>, B: for<'a> SpiDatum<'a>>(
         query: &str,
         args: Vec<(PgOid, Option<pg_sys::Datum>)>,
     ) -> Result<(Option<A>, Option<B>), Error> {
@@ -218,9 +220,9 @@ impl Spi {
     }
 
     pub fn get_three_with_args<
-        A: FromDatum + IntoDatum,
-        B: FromDatum + IntoDatum,
-        C: FromDatum + IntoDatum,
+        A: for<'a> SpiDatum<'a>,
+        B: for<'a> SpiDatum<'a>,
+        C: for<'a> SpiDatum<'a>,
     >(
         query: &str,
         args: Vec<(PgOid, Option<pg_sys::Datum>)>,
@@ -579,6 +581,37 @@ impl Drop for SpiCursor<'_> {
     }
 }
 
+/// This trait allows us to track within the type system whether T has any borrow from the Datum it is deserialized from
+/// Potentially the 'mem lifetime could be moved on FromDatum, as FromDatum impl determines whether T "borrows from" the Datum
+/// It is simpler to prototype this way, as changing FromDatum would require extensive changes everywhere
+pub trait SpiDatum<'mem> : FromDatum + IntoDatum {} // Only requires IntoDatum for IntoDatum::is_compatible_with via FromDatum::try_from_datum
+
+/// &str borrows Spi memory
+impl<'mem> SpiDatum<'mem> for &'mem str {}
+/// slices in general borrow from Spi memory
+impl<'mem> SpiDatum<'mem> for &[u8] {}
+/// for custom types, 'mem is bound to Serde Deserialize 'de lifetime
+impl<'mem, T> SpiDatum<'mem> for T where T: IntoDatum + PostgresType + Deserialize<'mem> {}
+
+/// Owned types have no borrow
+impl SpiDatum<'_> for String {}
+impl SpiDatum<'_> for Json {}
+impl SpiDatum<'_> for JsonB {}
+impl SpiDatum<'_> for () {}
+impl SpiDatum<'_> for bool {}
+impl SpiDatum<'_> for f32 {}
+impl SpiDatum<'_> for i64 {}
+impl SpiDatum<'_> for i32 {}
+impl SpiDatum<'_> for i8 {}
+impl SpiDatum<'_> for char {}
+impl SpiDatum<'_> for crate::Timestamp {}
+impl SpiDatum<'_> for crate::TimestampWithTimeZone {}
+impl SpiDatum<'_> for crate::Time {}
+impl SpiDatum<'_> for u32 {}
+impl SpiDatum<'_> for crate::Uuid {}
+impl SpiDatum<'_> for Vec<u8> {}
+impl<'a, T> SpiDatum<'a> for Vec<T> where T: SpiDatum<'a> {}
+
 impl SpiTupleTable {
     /// `SpiTupleTable`s are positioned before the start, for iteration purposes.
     ///
@@ -598,12 +631,14 @@ impl SpiTupleTable {
         self.len() == 0
     }
 
-    pub fn get_one<A: FromDatum + IntoDatum>(&self) -> Result<Option<A>, Error> {
+    // Within the SPI session, we can return borrowed data, bound to the table lifetime
+    // This allows us to free tables on drop within a single SPI session
+    pub fn get_one<'mem, A: SpiDatum<'mem>>(&'mem self) -> Result<Option<A>, Error> {
         self.get_datum(1)
     }
 
-    pub fn get_two<A: FromDatum + IntoDatum, B: FromDatum + IntoDatum>(
-        &self,
+    pub fn get_two<'mem, A: SpiDatum<'mem>, B: SpiDatum<'mem>>(
+        &'mem self,
     ) -> Result<(Option<A>, Option<B>), Error> {
         let a = self.get_datum::<A>(1)?;
         let b = self.get_datum::<B>(2)?;
@@ -611,11 +646,12 @@ impl SpiTupleTable {
     }
 
     pub fn get_three<
-        A: FromDatum + IntoDatum,
-        B: FromDatum + IntoDatum,
-        C: FromDatum + IntoDatum,
+        'mem,
+        A: SpiDatum<'mem>,
+        B: SpiDatum<'mem>,
+        C: SpiDatum<'mem>,
     >(
-        &self,
+        &'mem self,
     ) -> Result<(Option<A>, Option<B>, Option<C>), Error> {
         let a = self.get_datum::<A>(1)?;
         let b = self.get_datum::<B>(2)?;
@@ -643,7 +679,7 @@ impl SpiTupleTable {
         }
     }
 
-    pub fn get_datum<T: FromDatum + IntoDatum>(&self, ordinal: i32) -> Result<Option<T>, Error> {
+    pub fn get_datum<'mem, T: SpiDatum<'mem>>(&'mem self, ordinal: i32) -> Result<Option<T>, Error> {
         if self.current < 0 || self.current as usize >= self.size {
             return Err(Error::InvalidPosition);
         }
@@ -942,3 +978,35 @@ impl Iterator for SpiTupleTable {
     // Removed this function as it comes with an iterator
     //fn nth(&mut self, mut n: usize) -> Option<Self::Item> {
 }
+
+// TODO: convert into doctests with assertion it fails to compile
+/// Examples:
+///
+/// Does not compile, table is borrowed by the &str
+/// ```compile_fail
+///    Spi::connect(|client| {
+///        let table = client.select("SELECT 'mario'", None, None).first();
+///        let mario = table.get_one::<&str>().expect("ok").expect("some");
+///        drop(table);
+///        println!("{}", mario);
+///    })
+/// ```
+///
+/// Compiles, as String does not borrow table
+/// ```
+///    let mario = Spi::get_one::<String>("SELECT 1").expect("ok").expect("some");
+///    println!("{}", mario);
+/// ```
+///
+/// Does not compile, temp table is dropped while borrowed by the &str
+/// ```compile_fail
+///    let mario = Spi::get_one::<&str>("SELECT 1").expect("ok").expect("some");
+///    println!("{}", mario);
+/// ```
+pub fn examples() {}
+
+
+// Still unhandled:
+// * Types that hold pointers to pg memory but have no lifetime: PgBox
+// * Types that hold pointers to pg memory but have static lifetimes: PgVarlena
+// * Types I'm not familiar with: PgHeapTuple, PostgresEnum
